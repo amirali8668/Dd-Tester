@@ -12,10 +12,10 @@ app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
 # Safety limits for authorized testing only.
-MAX_TARGET_REQUESTS = int(os.getenv("MAX_TARGET_REQUESTS", "10000"))
-MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "50"))
-MAX_AGENTS = int(os.getenv("MAX_AGENTS", "20"))
-REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "4"))
+MAX_TARGET_REQUESTS = int(os.getenv("MAX_TARGET_REQUESTS", "100000"))
+MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "5000"))
+MAX_AGENTS = int(os.getenv("MAX_AGENTS", "100"))
+REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "1000"))
 
 # Optional comma-separated host allowlist.
 # Example:
