@@ -1,102 +1,98 @@
+import os
 import asyncio
 import aiohttp
 import time
-import csv
+from flask import Flask, render_template
+from flask_socketio import SocketIO, emit
 from fake_useragent import UserAgent
 
-# Configuration
-TARGET_SUCCESSFUL_RESPONSES = 100000
-NUM_AGENTS = 100
-CONCURRENCY_LIMIT = 5000  # 5K concurrent capacity
+app = Flask(__name__)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
 
-# Counters
-completed_responses = 0
-success_200 = 0
-rate_limited_429 = 0
-worker_errors_5xx = 0
-network_failures_ignored = 0
-stop_event = asyncio.Event()
-lock = asyncio.Lock()
+active_test = False
 
-ua = UserAgent()
-DEVICE_AGENTS = [ua.random for _ in range(NUM_AGENTS)]
+@app.route("/")
+def index():
+    return render_template("index.html")
 
-async def agent_task(agent_id, session, semaphore, url):
-    global completed_responses, success_200, rate_limited_429, worker_errors_5xx, network_failures_ignored
+def run_async_test(url, target_reqs, concurrency, num_agents):
+    global active_test
+    active_test = True
 
-    headers = {
-        "User-Agent": DEVICE_AGENTS[agent_id % len(DEVICE_AGENTS)],
-        "Accept": "*/*",
-        "Connection": "keep-alive"
-    }
+    completed = 0
+    status_200 = 0
+    status_429 = 0
+    status_5xx = 0
+    failed_ignored = 0
 
-    while not stop_event.is_set():
-        async with lock:
-            if completed_responses >= TARGET_SUCCESSFUL_RESPONSES:
-                stop_event.set()
-                break
+    ua = UserAgent()
+    agents = [ua.random for _ in range(num_agents)]
 
-        async with semaphore:
-            if stop_event.is_set():
-                break
+    async def worker():
+        nonlocal completed, status_200, status_429, status_5xx, failed_ignored
+        semaphore = asyncio.Semaphore(concurrency)
+        connector = aiohttp.TCPConnector(limit=concurrency, ssl=False)
 
-            try:
-                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=3)) as response:
-                    status = response.status
+        async with aiohttp.ClientSession(connector=connector) as session:
+            start_time = time.time()
 
-                    async with lock:
-                        # فقط درخواست‌هایی که پاسخ از سرور دریافت کرده‌اند شمارش می‌شوند
-                        completed_responses += 1
-                        current_req = completed_responses
+            async def send_req(agent_id):
+                nonlocal completed, status_200, status_429, status_5xx, failed_ignored
+                headers = {"User-Agent": agents[agent_id % len(agents)]}
 
-                        if status == 200:
-                            success_200 += 1
-                        elif status in [429, 403]:
-                            rate_limited_429 += 1
-                        elif status in [500, 502, 503, 504]:
-                            worker_errors_5xx += 1
+                while completed < target_reqs and active_test:
+                    async with semaphore:
+                        try:
+                            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=4)) as resp:
+                                completed += 1
+                                st = resp.status
+                                if st == 200: status_200 += 1
+                                elif st in [429, 403]: status_429 += 1
+                                elif st in [500, 502, 503, 504]: status_5xx += 1
 
-                        if current_req % 1000 == 0:
-                            print(f"[PROGRESS] {current_req}/{TARGET_SUCCESSFUL_RESPONSES} valid responses received...")
+                                if completed % 500 == 0:
+                                    elapsed = time.time() - start_time
+                                    socketio.emit("update", {
+                                        "completed": completed,
+                                        "target": target_reqs,
+                                        "s200": status_200,
+                                        "s429": status_429,
+                                        "s5xx": status_5xx,
+                                        "ignored": failed_ignored,
+                                        "rps": round(completed / elapsed, 2) if elapsed > 0 else 0
+                                    })
+                        except Exception:
+                            failed_ignored += 1
 
-                        if current_req >= TARGET_SUCCESSFUL_RESPONSES:
-                            stop_event.set()
-                            break
-
-            except Exception:
-                # درخواست‌های فیل شده به خاطر قطعی نت/تایم‌آوت نادیده گرفته می‌شوند
-                async with lock:
-                    network_failures_ignored += 1
-
-async def main():
-    print("=== MOBILE STABLE 5K BLASTER (EXCLUDING NETWORK FAILS) ===")
-    url = input("Enter Worker URL: ").strip()
-    if not url.startswith("http"):
-        url = "https://" + url
-
-    semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
-    connector = aiohttp.TCPConnector(limit=CONCURRENCY_LIMIT, ssl=False, ttl_dns_cache=300)
-
-    start_time = time.time()
-
-    async with aiohttp.ClientSession(connector=connector) as session:
-        tasks = [asyncio.create_task(agent_task(i, session, semaphore, url)) for i in range(NUM_AGENTS)]
-        try:
+            tasks = [asyncio.create_task(send_req(i)) for i in range(num_agents)]
             await asyncio.gather(*tasks, return_exceptions=True)
-        except KeyboardInterrupt:
-            stop_event.set()
 
-    elapsed_time = time.time() - start_time
+            elapsed = time.time() - start_time
+            socketio.emit("finished", {
+                "completed": completed,
+                "s200": status_200,
+                "s429": status_429,
+                "s5xx": status_5xx,
+                "ignored": failed_ignored,
+                "time": round(elapsed, 2),
+                "rps": round(completed / elapsed, 2) if elapsed > 0 else 0
+            })
 
-    print("\n=== FINAL RESULTS ===")
-    print(f"Valid Server Responses: {completed_responses}")
-    print(f"Ignored Network Failures: {network_failures_ignored}")
-    print(f"HTTP 200 OK: {success_200}")
-    print(f"Cloudflare Rate Limit (429/403): {rate_limited_429}")
-    print(f"Worker Errors (5xx): {worker_errors_5xx}")
-    print(f"Elapsed Time: {elapsed_time:.2f} seconds")
-    if elapsed_time > 0:
-        print(f"Effective Speed: {completed_responses / elapsed_time:.2f} req/sec")
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(worker())
+    active_test = False
+
+@socketio.on("start_test")
+def handle_start(data):
+    global active_test
+    if not active_test:
+        url = data.get("url")
+        target = int(data.get("target", 100000))
+        concurrency = int(data.get("concurrency", 5000))
+        agents = int(data.get("agents", 100))
+        socketio.start_background_task(run_async_test, url, target, concurrency, agents)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    port = int(os.environ.get("PORT", 5000))
+    socketio.run(app, host="0.0.0.0", port=port)
