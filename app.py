@@ -1,261 +1,1195 @@
 import os
 import asyncio
+import random
 import time
 from urllib.parse import urlparse
 
 import aiohttp
-from flask import Flask, jsonify, Response
-from flask_socketio import SocketIO
+from flask import Flask, Response, jsonify
+from flask_socketio import SocketIO, emit
 from fake_useragent import UserAgent
 
+
+# =========================================================
+# APP CONFIG
+# =========================================================
+
 app = Flask(__name__)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
-MAX_TARGET_REQUESTS = int(os.getenv("MAX_TARGET_REQUESTS", "100000"))
-MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "50"))
-MAX_AGENTS = int(os.getenv("MAX_AGENTS", "20"))
-REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "4"))
+socketio = SocketIO(
+    app,
+    cors_allowed_origins="*",
+    async_mode="threading",
+)
 
-ALLOWED_HOSTS = {
-    x.strip().lower()
-    for x in os.getenv("ALLOWED_HOSTS", "").split(",")
-    if x.strip()
-}
+MAX_TARGET_REQUESTS = int(
+    os.getenv("MAX_TARGET_REQUESTS", "100000")
+)
+
+MAX_CONCURRENCY = int(
+    os.getenv("MAX_CONCURRENCY", "50")
+)
+
+MAX_AGENTS = int(
+    os.getenv("MAX_AGENTS", "20")
+)
+
+REQUEST_TIMEOUT = float(
+    os.getenv("REQUEST_TIMEOUT", "4")
+)
+
+
+# =========================================================
+# GLOBAL STATE
+# =========================================================
 
 active_test = False
 stop_requested = False
 
 
-def is_allowed_url(url):
-    try:
-        p = urlparse(url)
-        return (
-            p.scheme in ("http", "https")
-            and bool(p.hostname)
-            and bool(ALLOWED_HOSTS)
-            and p.hostname.lower() in ALLOWED_HOSTS
-        )
-    except Exception:
-        return False
+# =========================================================
+# USER AGENTS
+# =========================================================
+
+try:
+    ua = UserAgent()
+
+    USER_AGENTS = [
+        ua.random
+        for _ in range(MAX_AGENTS)
+    ]
+
+except Exception:
+    USER_AGENTS = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 Chrome/140.0 Safari/537.36",
+
+        "Mozilla/5.0 (X11; Linux x86_64) "
+        "AppleWebKit/537.36 Chrome/140.0 Safari/537.36",
+
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/605.1.15 Version/18.0 Safari/605.1.15",
+    ]
 
 
-HTML = r"""<!doctype html>
+# =========================================================
+# HTML PANEL
+# =========================================================
+
+HTML = r"""
+<!DOCTYPE html>
 <html lang="en">
+
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>HTTP Test Panel</title>
-<style>
-body{margin:0;background:#0b1020;color:#e8ecf7;font-family:Arial,sans-serif}
-.wrap{max-width:1000px;margin:25px auto;padding:15px}
-.card{background:#121a2d;border:1px solid #293653;border-radius:14px;padding:18px;margin-bottom:15px}
-h1{margin:0 0 7px}.muted{color:#91a0bc;font-size:13px}
-.grid{display:grid;grid-template-columns:2fr 1fr 1fr 1fr;gap:10px}
-label{display:block;color:#aebbd2;font-size:12px;margin-bottom:6px}
-input{width:100%;padding:11px;border-radius:9px;border:1px solid #34425f;background:#0c1324;color:white}
-button{padding:11px 18px;border:0;border-radius:9px;cursor:pointer;font-weight:bold;margin-top:12px;margin-right:7px}
-.start{background:#36d399}.stop{background:#ff6b6b}
-.stats{display:grid;grid-template-columns:repeat(5,1fr);gap:9px}
-.stat{background:#0c1324;border-radius:9px;padding:12px}
-.stat b{display:block;font-size:20px;margin-top:5px}
-.log{height:360px;overflow:auto;background:#070b14;border-radius:9px;padding:12px;font:12px monospace;white-space:pre-wrap}
-.ok{color:#54e39b}.bad{color:#ff8585}
-@media(max-width:700px){.grid,.stats{grid-template-columns:1fr 1fr}.grid>:first-child{grid-column:1/-1}}
-</style>
+    <meta charset="UTF-8">
+
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1.0"
+    >
+
+    <title>HTTP Test Panel</title>
+
+    <script
+        src="https://cdn.socket.io/4.7.5/socket.io.min.js">
+    </script>
+
+    <style>
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            background: #0b0f17;
+            color: #e8edf5;
+            font-family:
+                Arial,
+                Helvetica,
+                sans-serif;
+        }
+
+        .container {
+            width: min(1100px, 94%);
+            margin: 30px auto;
+        }
+
+        .header {
+            margin-bottom: 20px;
+        }
+
+        .header h1 {
+            margin: 0 0 7px;
+            font-size: 28px;
+        }
+
+        .header p {
+            margin: 0;
+            color: #8994a5;
+        }
+
+        .card {
+            background: #111827;
+            border: 1px solid #202b3d;
+            border-radius: 14px;
+            padding: 20px;
+            margin-bottom: 18px;
+            box-shadow:
+                0 10px 30px rgba(0, 0, 0, .18);
+        }
+
+        label {
+            display: block;
+            margin-bottom: 7px;
+            color: #aeb8c7;
+            font-size: 14px;
+        }
+
+        input {
+            width: 100%;
+            background: #0b1220;
+            color: white;
+            border: 1px solid #2b3850;
+            border-radius: 9px;
+            padding: 12px;
+            outline: none;
+            font-size: 14px;
+        }
+
+        input:focus {
+            border-color: #667eea;
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns:
+                repeat(3, 1fr);
+            gap: 14px;
+            margin-top: 14px;
+        }
+
+        .buttons {
+            display: flex;
+            gap: 10px;
+            margin-top: 18px;
+        }
+
+        button {
+            border: 0;
+            border-radius: 9px;
+            padding: 12px 20px;
+            cursor: pointer;
+            color: white;
+            font-weight: bold;
+        }
+
+        #startBtn {
+            background: #2563eb;
+        }
+
+        #stopBtn {
+            background: #dc2626;
+        }
+
+        button:disabled {
+            opacity: .5;
+            cursor: not-allowed;
+        }
+
+        .stats {
+            display: grid;
+            grid-template-columns:
+                repeat(5, 1fr);
+            gap: 12px;
+        }
+
+        .stat {
+            background: #0b1220;
+            border: 1px solid #202b3d;
+            border-radius: 10px;
+            padding: 15px;
+        }
+
+        .stat-title {
+            color: #8d99aa;
+            font-size: 13px;
+            margin-bottom: 8px;
+        }
+
+        .stat-value {
+            font-size: 23px;
+            font-weight: bold;
+        }
+
+        .log-title {
+            margin-bottom: 10px;
+            font-weight: bold;
+        }
+
+        #log {
+            height: 360px;
+            overflow-y: auto;
+            background: #070b12;
+            border: 1px solid #202b3d;
+            border-radius: 9px;
+            padding: 12px;
+            font-family:
+                Consolas,
+                Monaco,
+                monospace;
+            font-size: 12px;
+            white-space: pre-wrap;
+        }
+
+        .log-line {
+            margin-bottom: 5px;
+            color: #b8c2d1;
+        }
+
+        .status {
+            display: inline-block;
+            margin-top: 12px;
+            padding: 6px 10px;
+            border-radius: 20px;
+            background: #172033;
+            color: #aeb8c7;
+            font-size: 13px;
+        }
+
+        @media (max-width: 800px) {
+
+            .grid {
+                grid-template-columns: 1fr;
+            }
+
+            .stats {
+                grid-template-columns:
+                    repeat(2, 1fr);
+            }
+
+        }
+
+    </style>
 </head>
+
+
 <body>
-<div class="wrap">
-<div class="card">
-<h1>HTTP Test Panel</h1>
-<div class="muted">Only domains listed in ALLOWED_HOSTS can be tested.</div>
+
+<div class="container">
+
+    <div class="header">
+
+        <h1>HTTP Test Panel</h1>
+
+        <p>
+            Live HTTP request testing dashboard
+        </p>
+
+        <div id="status"
+             class="status">
+            Disconnected
+        </div>
+
+    </div>
+
+
+    <div class="card">
+
+        <label>
+            Target URL
+        </label>
+
+        <input
+            id="url"
+            type="text"
+            placeholder="https://example.com"
+        >
+
+
+        <div class="grid">
+
+            <div>
+
+                <label>
+                    Requests
+                </label>
+
+                <input
+                    id="requests"
+                    type="number"
+                    value="100000"
+                    min="1"
+                    max="100000"
+                >
+
+            </div>
+
+
+            <div>
+
+                <label>
+                    Concurrency
+                </label>
+
+                <input
+                    id="concurrency"
+                    type="number"
+                    value="50"
+                    min="1"
+                    max="50"
+                >
+
+            </div>
+
+
+            <div>
+
+                <label>
+                    User Agents
+                </label>
+
+                <input
+                    id="agents"
+                    type="number"
+                    value="20"
+                    min="1"
+                    max="20"
+                >
+
+            </div>
+
+        </div>
+
+
+        <div class="buttons">
+
+            <button
+                id="startBtn"
+                onclick="startTest()">
+                START
+            </button>
+
+            <button
+                id="stopBtn"
+                onclick="stopTest()"
+                disabled>
+                STOP
+            </button>
+
+        </div>
+
+    </div>
+
+
+    <div class="card">
+
+        <div class="stats">
+
+            <div class="stat">
+
+                <div class="stat-title">
+                    Completed
+                </div>
+
+                <div
+                    id="completed"
+                    class="stat-value">
+                    0
+                </div>
+
+            </div>
+
+
+            <div class="stat">
+
+                <div class="stat-title">
+                    HTTP 200
+                </div>
+
+                <div
+                    id="success"
+                    class="stat-value">
+                    0
+                </div>
+
+            </div>
+
+
+            <div class="stat">
+
+                <div class="stat-title">
+                    403 / 429
+                </div>
+
+                <div
+                    id="blocked"
+                    class="stat-value">
+                    0
+                </div>
+
+            </div>
+
+
+            <div class="stat">
+
+                <div class="stat-title">
+                    5xx
+                </div>
+
+                <div
+                    id="serverErrors"
+                    class="stat-value">
+                    0
+                </div>
+
+            </div>
+
+
+            <div class="stat">
+
+                <div class="stat-title">
+                    RPS
+                </div>
+
+                <div
+                    id="rps"
+                    class="stat-value">
+                    0
+                </div>
+
+            </div>
+
+        </div>
+
+    </div>
+
+
+    <div class="card">
+
+        <div class="log-title">
+            Live Logs
+        </div>
+
+        <div id="log"></div>
+
+    </div>
+
 </div>
 
-<div class="card">
-<div class="grid">
-<div><label>URL</label><input id="url" placeholder="https://your-domain.com/"></div>
-<div><label>Requests</label><input id="target" type="number" value="1000" min="1" max="100000"></div>
-<div><label>Concurrency</label><input id="concurrency" type="number" value="10" min="1" max="50"></div>
-<div><label>Agents</label><input id="agents" type="number" value="5" min="1" max="20"></div>
-</div>
-<button class="start" onclick="startTest()">Start</button>
-<button class="stop" onclick="stopTest()">Stop</button>
-</div>
 
-<div class="card">
-<div class="stats">
-<div class="stat">Completed<b id="completed">0</b></div>
-<div class="stat">200<b id="s200">0</b></div>
-<div class="stat">403/429<b id="s429">0</b></div>
-<div class="stat">5xx<b id="s5xx">0</b></div>
-<div class="stat">RPS<b id="rps">0</b></div>
-</div>
-</div>
-
-<div class="card">
-<div class="muted">Live request log</div>
-<div id="log" class="log"></div>
-</div>
-</div>
-
-<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
 <script>
-const socket=io(), box=document.getElementById("log");
-function log(s,c=""){let x=document.createElement("div");x.className=c;x.textContent="["+new Date().toLocaleTimeString()+"] "+s;box.appendChild(x);while(box.children.length>300)box.removeChild(box.firstChild);box.scrollTop=box.scrollHeight}
-function setv(id,v){document.getElementById(id).textContent=v}
-function startTest(){
- let d={url:document.getElementById("url").value.trim(),target:+document.getElementById("target").value,concurrency:+document.getElementById("concurrency").value,agents:+document.getElementById("agents").value};
- log("Starting: "+d.url);socket.emit("start_test",d)
-}
-function stopTest(){socket.emit("stop_test");log("Stop requested.")}
-socket.on("connect",()=>log("Connected.","ok"));
-socket.on("disconnect",()=>log("Disconnected.","bad"));
-socket.on("error",d=>log("ERROR: "+d.message,"bad"));
-socket.on("update",d=>{
- setv("completed",d.completed+" / "+d.target);setv("s200",d.s200);setv("s429",d.s429);setv("s5xx",d.s5xx);setv("rps",d.rps);
- log("Progress "+d.completed+"/"+d.target+" | 200="+d.s200+" | 403/429="+d.s429+" | 5xx="+d.s5xx+" | RPS="+d.rps)
-});
-socket.on("finished",d=>{
- setv("completed",d.completed);setv("s200",d.s200);setv("s429",d.s429);setv("s5xx",d.s5xx);setv("rps",d.rps);
- log("Finished: "+d.completed+" requests, "+d.time+"s, RPS="+d.rps,"ok")
-});
-</script>
-</body>
-</html>"""
 
+const socket = io();
+
+const statusElement =
+    document.getElementById("status");
+
+const startButton =
+    document.getElementById("startBtn");
+
+const stopButton =
+    document.getElementById("stopBtn");
+
+
+function addLog(message) {
+
+    const log =
+        document.getElementById("log");
+
+    const now =
+        new Date().toLocaleTimeString();
+
+    const line =
+        document.createElement("div");
+
+    line.className = "log-line";
+
+    line.textContent =
+        "[" + now + "] " + message;
+
+    log.appendChild(line);
+
+    log.scrollTop =
+        log.scrollHeight;
+
+}
+
+
+function setRunning(running) {
+
+    startButton.disabled = running;
+    stopButton.disabled = !running;
+
+}
+
+
+function resetStats() {
+
+    document.getElementById("completed")
+        .textContent = "0";
+
+    document.getElementById("success")
+        .textContent = "0";
+
+    document.getElementById("blocked")
+        .textContent = "0";
+
+    document.getElementById("serverErrors")
+        .textContent = "0";
+
+    document.getElementById("rps")
+        .textContent = "0";
+
+}
+
+
+function startTest() {
+
+    const url =
+        document.getElementById("url")
+        .value.trim();
+
+    const requests =
+        Number(
+            document.getElementById("requests")
+            .value
+        );
+
+    const concurrency =
+        Number(
+            document.getElementById("concurrency")
+            .value
+        );
+
+    const agents =
+        Number(
+            document.getElementById("agents")
+            .value
+        );
+
+
+    if (!url) {
+
+        addLog("ERROR: Please enter a URL.");
+
+        return;
+
+    }
+
+
+    resetStats();
+
+    document.getElementById("log")
+        .innerHTML = "";
+
+    setRunning(true);
+
+    addLog("Starting test...");
+
+    socket.emit(
+        "start_test",
+        {
+            url: url,
+            target_reqs: requests,
+            concurrency: concurrency,
+            num_agents: agents
+        }
+    );
+
+}
+
+
+function stopTest() {
+
+    socket.emit("stop_test");
+
+    addLog("Stop requested...");
+
+}
+
+
+socket.on("connect", function() {
+
+    statusElement.textContent =
+        "Connected";
+
+    addLog("Connected to server.");
+
+});
+
+
+socket.on("disconnect", function() {
+
+    statusElement.textContent =
+        "Disconnected";
+
+    addLog("Disconnected from server.");
+
+});
+
+
+socket.on("update", function(data) {
+
+    if (data.completed !== undefined) {
+
+        document.getElementById("completed")
+            .textContent =
+            data.completed.toLocaleString();
+
+    }
+
+    if (data.success !== undefined) {
+
+        document.getElementById("success")
+            .textContent =
+            data.success.toLocaleString();
+
+    }
+
+    if (data.blocked !== undefined) {
+
+        document.getElementById("blocked")
+            .textContent =
+            data.blocked.toLocaleString();
+
+    }
+
+    if (data.server_errors !== undefined) {
+
+        document.getElementById("serverErrors")
+            .textContent =
+            data.server_errors.toLocaleString();
+
+    }
+
+    if (data.rps !== undefined) {
+
+        document.getElementById("rps")
+            .textContent =
+            Number(data.rps).toFixed(2);
+
+    }
+
+    if (data.message) {
+
+        addLog(data.message);
+
+    }
+
+});
+
+
+socket.on("finished", function(data) {
+
+    setRunning(false);
+
+    addLog(
+        "Finished. " +
+        "Completed: " +
+        (data.completed || 0).toLocaleString()
+    );
+
+});
+
+
+socket.on("error", function(data) {
+
+    setRunning(false);
+
+    addLog(
+        "ERROR: " +
+        (data.message || "Unknown error")
+    );
+
+});
+
+
+</script>
+
+</body>
+
+</html>
+"""
+
+
+# =========================================================
+# ROUTES
+# =========================================================
 
 @app.route("/")
 def index():
-    return Response(HTML, mimetype="text/html")
+
+    return Response(
+        HTML,
+        mimetype="text/html"
+    )
 
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "active_test": active_test})
+
+    return jsonify({
+        "status": "ok",
+        "active_test": active_test
+    })
 
 
-def run_async_test(url, target, concurrency, agents_count):
-    global active_test, stop_requested
-    active_test = True
-    stop_requested = False
-    completed = s200 = s429 = s5xx = failed = 0
+# =========================================================
+# URL VALIDATION
+# =========================================================
+
+def validate_url(url):
 
     try:
-        try:
-            ua = UserAgent()
-            agents = [ua.random for _ in range(agents_count)]
-        except Exception:
-            agents = ["authorized-test-client/1.0"]
 
-        async def worker():
-            nonlocal completed, s200, s429, s5xx, failed
-            sem = asyncio.Semaphore(concurrency)
-            connector = aiohttp.TCPConnector(
-                limit=concurrency, limit_per_host=concurrency, ssl=False
-            )
-            timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+        parsed = urlparse(url)
 
-            async with aiohttp.ClientSession(
-                connector=connector, timeout=timeout
-            ) as session:
-                started = time.time()
+        if parsed.scheme not in (
+            "http",
+            "https"
+        ):
+            return False
 
-                async def one_worker(i):
-                    nonlocal completed, s200, s429, s5xx, failed
+        if not parsed.hostname:
+            return False
+
+        return True
+
+    except Exception:
+
+        return False
+
+
+# =========================================================
+# ASYNC TEST
+# =========================================================
+
+async def run_async_test(
+    url,
+    target_reqs,
+    concurrency,
+    num_agents
+):
+
+    global active_test
+    global stop_requested
+
+    completed = 0
+    success = 0
+    blocked = 0
+    server_errors = 0
+
+    started_at = time.monotonic()
+
+    semaphore = asyncio.Semaphore(
+        concurrency
+    )
+
+    timeout = aiohttp.ClientTimeout(
+        total=REQUEST_TIMEOUT
+    )
+
+
+    connector = aiohttp.TCPConnector(
+        limit=concurrency,
+        limit_per_host=concurrency,
+        ssl=False
+    )
+
+
+    async with aiohttp.ClientSession(
+        timeout=timeout,
+        connector=connector
+    ) as session:
+
+
+        async def one_request():
+
+            nonlocal completed
+            nonlocal success
+            nonlocal blocked
+            nonlocal server_errors
+
+            global stop_requested
+
+            if stop_requested:
+                return
+
+
+            async with semaphore:
+
+                try:
+
                     headers = {
-                        "User-Agent": agents[i % len(agents)],
-                        "X-Authorized-Test": "true"
+                        "User-Agent":
+                            random.choice(
+                                USER_AGENTS[:max(
+                                    1,
+                                    min(
+                                        num_agents,
+                                        len(USER_AGENTS)
+                                    )
+                                )]
+                            ),
+                        "Accept":
+                            "*/*",
+                        "Connection":
+                            "keep-alive"
                     }
-                    while completed < target and not stop_requested:
-                        async with sem:
-                            if completed >= target or stop_requested:
-                                break
-                            try:
-                                async with session.get(url, headers=headers) as r:
-                                    completed += 1
-                                    if r.status == 200:
-                                        s200 += 1
-                                    elif r.status in (403, 429):
-                                        s429 += 1
-                                    elif r.status in (500, 502, 503, 504):
-                                        s5xx += 1
-                                    if completed % 100 == 0 or completed == target:
-                                        elapsed = time.time() - started
-                                        socketio.emit("update", {
-                                            "completed": completed,
-                                            "target": target,
-                                            "s200": s200,
-                                            "s429": s429,
-                                            "s5xx": s5xx,
-                                            "ignored": failed,
-                                            "rps": round(completed / elapsed, 2) if elapsed else 0
-                                        })
-                            except Exception:
-                                failed += 1
 
-                await asyncio.gather(
-                    *(asyncio.create_task(one_worker(i)) for i in range(agents_count)),
-                    return_exceptions=True
+
+                    async with session.get(
+                        url,
+                        headers=headers,
+                        allow_redirects=True
+                    ) as response:
+
+                        status = response.status
+
+                        # Read response body so the
+                        # connection can be reused.
+                        await response.read()
+
+
+                        if status == 200:
+
+                            success += 1
+
+                        elif status in (
+                            403,
+                            429
+                        ):
+
+                            blocked += 1
+
+                        elif 500 <= status <= 599:
+
+                            server_errors += 1
+
+
+                except Exception:
+
+                    server_errors += 1
+
+
+                finally:
+
+                    completed += 1
+
+
+        while (
+            completed < target_reqs
+            and not stop_requested
+        ):
+
+            remaining = target_reqs - completed
+
+            batch_size = min(
+                concurrency,
+                remaining
+            )
+
+
+            tasks = [
+                asyncio.create_task(
+                    one_request()
                 )
+                for _ in range(batch_size)
+            ]
 
-                elapsed = time.time() - started
-                socketio.emit("finished", {
-                    "completed": completed, "s200": s200, "s429": s429,
-                    "s5xx": s5xx, "ignored": failed,
-                    "time": round(elapsed, 2),
-                    "rps": round(completed / elapsed, 2) if elapsed else 0
-                })
 
-        loop = asyncio.new_event_loop()
-        try:
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(worker())
-        finally:
-            loop.close()
-    finally:
-        active_test = False
-        stop_requested = False
+            await asyncio.gather(
+                *tasks,
+                return_exceptions=True
+            )
 
+
+            elapsed = (
+                time.monotonic()
+                - started_at
+            )
+
+
+            rps = (
+                completed / elapsed
+                if elapsed > 0
+                else 0
+            )
+
+
+            socketio.emit(
+                "update",
+                {
+                    "completed": completed,
+                    "success": success,
+                    "blocked": blocked,
+                    "server_errors":
+                        server_errors,
+                    "rps": rps,
+                    "message":
+                        f"Progress: "
+                        f"{completed:,}/"
+                        f"{target_reqs:,} | "
+                        f"RPS: {rps:.2f}"
+                }
+            )
+
+
+    elapsed = (
+        time.monotonic()
+        - started_at
+    )
+
+
+    rps = (
+        completed / elapsed
+        if elapsed > 0
+        else 0
+    )
+
+
+    active_test = False
+
+
+    socketio.emit(
+        "finished",
+        {
+            "completed": completed,
+            "success": success,
+            "blocked": blocked,
+            "server_errors":
+                server_errors,
+            "rps": rps,
+            "stopped":
+                stop_requested
+        }
+    )
+
+
+    stop_requested = False
+
+
+# =========================================================
+# SOCKET EVENTS
+# =========================================================
 
 @socketio.on("start_test")
-def handle_start(data):
+def start_test(data):
+
     global active_test
+    global stop_requested
+
+
     if active_test:
-        socketio.emit("error", {"message": "A test is already running."})
+
+        emit(
+            "error",
+            {
+                "message":
+                    "A test is already running."
+            }
+        )
+
         return
 
-    url = str(data.get("url", "")).strip()
-    if not is_allowed_url(url):
-        socketio.emit("error", {
-            "message": "URL is not in ALLOWED_HOSTS."
-        })
+
+    data = data or {}
+
+
+    url = str(
+        data.get("url", "")
+    ).strip()
+
+
+    if not validate_url(url):
+
+        emit(
+            "error",
+            {
+                "message":
+                    "Invalid URL. Use http:// or https://."
+            }
+        )
+
         return
+
 
     try:
-        target = int(data.get("target", 1000))
-        concurrency = int(data.get("concurrency", 10))
-        agents = int(data.get("agents", 5))
-    except (TypeError, ValueError):
-        socketio.emit("error", {"message": "Invalid numeric parameters."})
+
+        target_reqs = int(
+            data.get(
+                "target_reqs",
+                MAX_TARGET_REQUESTS
+            )
+        )
+
+        concurrency = int(
+            data.get(
+                "concurrency",
+                MAX_CONCURRENCY
+            )
+        )
+
+        num_agents = int(
+            data.get(
+                "num_agents",
+                MAX_AGENTS
+            )
+        )
+
+    except (
+        ValueError,
+        TypeError
+    ):
+
+        emit(
+            "error",
+            {
+                "message":
+                    "Invalid numeric values."
+            }
+        )
+
         return
 
-    target = max(1, min(target, MAX_TARGET_REQUESTS))
-    concurrency = max(1, min(concurrency, MAX_CONCURRENCY))
-    agents = max(1, min(agents, MAX_AGENTS))
+
+    target_reqs = max(
+        1,
+        min(
+            target_reqs,
+            MAX_TARGET_REQUESTS
+        )
+    )
+
+
+    concurrency = max(
+        1,
+        min(
+            concurrency,
+            MAX_CONCURRENCY
+        )
+    )
+
+
+    num_agents = max(
+        1,
+        min(
+            num_agents,
+            MAX_AGENTS
+        )
+    )
+
+
+    active_test = True
+    stop_requested = False
+
+
+    emit(
+        "update",
+        {
+            "message":
+                f"Test started: {url}"
+        }
+    )
+
 
     socketio.start_background_task(
-        run_async_test, url, target, concurrency, agents
+        run_test_wrapper,
+        url,
+        target_reqs,
+        concurrency,
+        num_agents
     )
 
 
 @socketio.on("stop_test")
-def handle_stop():
-    global stop_requested
-    stop_requested = True
+def stop_test():
 
+    global stop_requested
+
+    if active_test:
+
+        stop_requested = True
+
+        emit(
+            "update",
+            {
+                "message":
+                    "Stopping test..."
+            }
+        )
+
+    else:
+
+        emit(
+            "update",
+            {
+                "message":
+                    "No active test."
+            }
+        )
+
+
+# =========================================================
+# BACKGROUND WRAPPER
+# =========================================================
+
+def run_test_wrapper(
+    url,
+    target_reqs,
+    concurrency,
+    num_agents
+):
+
+    global active_test
+
+    try:
+
+        asyncio.run(
+            run_async_test(
+                url,
+                target_reqs,
+                concurrency,
+                num_agents
+            )
+        )
+
+    except Exception as e:
+
+        active_test = False
+
+        socketio.emit(
+            "error",
+            {
+                "message":
+                    f"Test error: {e}"
+            }
+        )
+
+
+# =========================================================
+# MAIN
+# =========================================================
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "5000"))
+
+    port = int(
+        os.getenv(
+            "PORT",
+            "5000"
+        )
+    )
+
+
+    print(
+        f"Starting server on port {port}"
+    )
+
+
     socketio.run(
-        app, host="0.0.0.0", port=port,
+        app,
+        host="0.0.0.0",
+        port=port,
         allow_unsafe_werkzeug=True
     )
